@@ -1,0 +1,29 @@
+name: Auto Scan Proxy IPs
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'  # 每 12 小时自动执行一次
+  workflow_dispatch:        # 支持在 GitHub 网页上手动点击触发
+
+jobs:
+  run-python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 安装必要的依赖库
+        run: pip install requests
+
+      - name: 运行测速和更新脚本
+        env:
+          CHECKER_URL: ${{ secrets.CHECKER_URL }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python update_proxy.py
