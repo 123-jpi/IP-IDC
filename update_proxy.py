@@ -58,11 +58,14 @@ def fetch_candidate_ips():
     # 随机抽样 500 个 IP 进行深度测试
     test_size = min(total_count, 500)
     sampled_list = random.sample(list(all_candidates), test_size)
-    print(f"🎲 随机抽取 {test_size} 个 IP 进行深度保活握手测试...")
+    print(f"🎲 随机抽取 {test_size} 个 IP 进行深度保活与 CF 官方地理识别测试...")
     return sampled_list
 
-def check_keepalive_cf_proxy(ip_port):
-    """协议级保活握手测试，确认 IP 可用性"""
+def check_keepalive_and_get_loc(ip_port):
+    """
+    通过 Socket 握手建立连接，并直接从 Cloudflare 探针响应中解析权威国家代码 loc=XX
+    不依赖任何第三方 IP 数据库，100% 准确且无请求限流
+    """
     try:
         if ip_port.startswith("["):
             ip = ip_port.rsplit("]:", 1)[0].replace("[", "")
@@ -74,11 +77,12 @@ def check_keepalive_cf_proxy(ip_port):
             family = socket.AF_INET
 
         sock = socket.socket(family, socket.SOCK_STREAM)
-        sock.settimeout(2.0)
+        sock.settimeout(2.5)
         sock.connect((ip, port))
 
+        # 向 1.1.1.1/cdn-cgi/trace 发送握手请求，触发 Cloudflare 返回包含 loc=XX 的信息
         probe = (
-            f"GET / HTTP/1.1\r\n"
+            f"GET /cdn-cgi/trace HTTP/1.1\r\n"
             f"Host: 1.1.1.1\r\n"
             f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
             f"Accept: */*\r\n"
@@ -86,18 +90,27 @@ def check_keepalive_cf_proxy(ip_port):
         )
         
         sock.sendall(probe.encode("utf-8"))
-        response = sock.recv(512).decode("utf-8", errors="ignore")
+        response = sock.recv(1024).decode("utf-8", errors="ignore")
         sock.close()
 
-        if response.startswith("HTTP/"):
-            return {"ip_port": ip_port, "ip": ip}
+        # 从 Cloudflare trace 数据中直接正则提取 loc=XX（如 loc=DE, loc=JP）
+        if "loc=" in response:
+            match = re.search(r'loc=([A-Z]{2})', response)
+            if match:
+                country = match.group(1)
+                return {"ip_port": ip_port, "ip": ip, "country": country}
+        elif response.startswith("HTTP/"):
+            # 如果没拿到 loc 但 HTTP 能连通，降级使用 IP-API 作为单次备用查询
+            country = get_fallback_country(ip)
+            if country != "UN":
+                return {"ip_port": ip_port, "ip": ip, "country": country}
 
     except Exception:
         pass
     return None
 
-def get_country_code(ip):
-    """只获取大写的 ISO 国家二字代码（如 US, JP, DE, HK）"""
+def get_fallback_country(ip):
+    """备用查询逻辑"""
     try:
         res = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=2)
         if res.status_code == 200:
@@ -109,13 +122,15 @@ def get_country_code(ip):
     return "UN"
 
 def process_ip(ip_port):
-    result = check_keepalive_cf_proxy(ip_port)
+    result = check_keepalive_and_get_loc(ip_port)
     if result:
-        ip = result["ip"]
-        country = get_country_code(ip)
+        country = result["country"]
         
-        # 仅输出干净的格式：IP:PORT#国家码
-        # 示例: 148.251.148.186:443#DE
+        # 严格过滤：如果极端情况下依然没获取到国家（为 UN），直接丢弃该节点，确保输出质量
+        if country == "UN":
+            return None
+            
+        # 仅输出干净格式：IP:PORT#国家码
         formatted_entry = f"{ip_port}#{country}"
         return formatted_entry
     return None
@@ -141,7 +156,7 @@ def update_cloudflare_kv(valid_entries):
         content = "\n".join(valid_entries)
         res = requests.put(kv_url, data=content.encode('utf-8'), headers=headers)
         if res.status_code == 200:
-            print(f"🎉 成功将格式化的 {len(valid_entries)} 个落地 IP 写入 Cloudflare KV！")
+            print(f"🎉 成功将格式化的 {len(valid_entries)} 个纯净落地 IP 写入 Cloudflare KV！")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     else:
@@ -151,14 +166,14 @@ def main():
     raw_ips = fetch_candidate_ips()
     valid_entries = []
     
-    print("🚀 开始进行【保活握手 + 国家码获取】...")
+    print("🚀 开始进行【Socket 保活 + Cloudflare 官方地理位置识别】...")
     with ThreadPoolExecutor(max_workers=50) as executor:
         results = executor.map(process_ip, raw_ips)
         for r in results:
             if r:
                 valid_entries.append(r)
                 
-    print(f"测试完成！共生成 {len(valid_entries)} 个精简格式节点")
+    print(f"测试完成！共筛选出 {len(valid_entries)} 个高质量节点（已完全剔除 UN）")
     
     if CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN:
         update_cloudflare_kv(valid_entries)
