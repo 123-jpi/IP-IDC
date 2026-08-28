@@ -11,7 +11,8 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 
 # 公开 IP 抓取源（可以自己往里面加其他 txt 网址）
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/cmliu/CF-Workers-SUB/main/proxyip.txt",
+    "https://github.com/iplocate/free-proxy-list/blob/main/all-proxies.txt",
+    
 ]
 
 def fetch_candidate_ips():
