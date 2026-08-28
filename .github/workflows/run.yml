@@ -2,14 +2,14 @@ name: Auto Scan Proxy IPs
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # 每 12 小时自动执行一次
-  workflow_dispatch:        # 支持在 GitHub 网页上手动点击触发
+    - cron: '0 */2 * * *'  # 每 2 小时定时自动跑一次
+  workflow_dispatch:        # 支持手动点按 Run Workflow
 
 jobs:
   run-python:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出仓库代码
+      - name: 检出代码
         uses: actions/checkout@v4.2.2
 
       - name: 安装 Python 环境
@@ -17,12 +17,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: 安装必要的依赖库
+      - name: 安装依赖包
         run: pip install requests
 
-      - name: 运行测速和更新脚本
+      - name: 执行测试与更新
         env:
-          CHECKER_URL: ${{ secrets.CHECKER_URL }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
