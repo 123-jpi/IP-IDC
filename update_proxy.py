@@ -68,7 +68,7 @@ COLO_CITY_MAP = {
 }
 
 PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/cmliu/CF-Workers-SUB/main/proxyip.txt",
+    "https://zip.cm.edu.kg/all.txt",
 ]
 
 def clean_and_extract_ip(raw_text):
