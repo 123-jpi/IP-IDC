@@ -1,108 +1,124 @@
 import os
 import re
+import socket
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
-# 从 GitHub Secrets 获取配置参数
-CHECKER_URL = os.environ.get("CHECKER_URL", "").rstrip('/')
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
 CF_KV_NAMESPACE_ID = os.environ.get("CF_KV_NAMESPACE_ID")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 
-# 公开 IP 抓取源（可以自己往里面加其他 txt 网址）
+# 支持的 Cloudflare 代理端口列表
+CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 8880}
+
 PROXY_SOURCES = [
-    "https://github.com/iplocate/free-proxy-list/blob/main/all-proxies.txt",
-    
+    "https://raw.githubusercontent.com/cmliu/CF-Workers-SUB/main/proxyip.txt",
 ]
 
 def fetch_candidate_ips():
-    """从网络公开源抓取候选 IP:PORT"""
     candidates = set()
-    # 正则表达式识别 IPv4:端口 和 [IPv6]:端口
     ip_pattern = re.compile(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+|\[[0-9a-fA-F:]+\]:\d+)')
-    
     for url in PROXY_SOURCES:
         try:
-            res = requests.get(url, timeout=10)
+            res = requests.get(url, timeout=5)
             if res.status_code == 200:
                 matches = ip_pattern.findall(res.text)
-                candidates.update(matches)
-                print(f"从 {url} 获取到 {len(matches)} 个潜在 IP")
+                for item in matches:
+                    # 过滤出符合 CF 规则的端口
+                    port = int(item.rsplit(":", 1)[-1])
+                    if port in CF_ALLOWED_PORTS:
+                        candidates.add(item)
         except Exception as e:
             print(f"抓取源失败 {url}: {e}")
             
-    print(f"合并去重后，共有 {len(candidates)} 个候选 IP 待检测")
-    return list(candidates)
+    raw_list = list(candidates)[:200]  # 限制数量，保障几秒内测试完成
+    print(f"筛选出符合 CF 端口规则的候选 IP: {len(raw_list)} 个")
+    return raw_list
 
-def get_flag_emoji(country_code):
-    """把国家代码（如 US）转成国旗 Emoji（如 🇺🇸）"""
-    if not country_code or len(country_code) != 2:
-        return "🌐"
-    return "".join(chr(127397 + ord(c)) for c in country_code.upper())
-
-def check_ip(ip_port):
-    """调用 cmliu 的 /check API 校验 IP 是否可用，并获取延迟和位置信息"""
-    url = f"{CHECKER_URL}/check?proxyip={ip_port}"
+def check_cf_proxy_compatibility(ip_port):
+    """
+    通过模拟 Cloudflare 握手请求，检测该 IP 是否可作为 CF 落地代理
+    """
     try:
-        res = requests.get(url, timeout=6)
-        if res.status_code == 200:
-            data = res.json()
-            # 如果测速节点返回 success 为 true，说明此 IP 可用
-            if data.get("success") is True:
-                loc = data.get("loc", "🌐").upper()
-                colo = data.get("colo", "UNK").upper()
-                delay = data.get("responseTime", 999)
-                flag = get_flag_emoji(loc)
-                
-                # 拼接成 edgetunnel 认识的格式：IP:端口#国旗 国家 - 机房 - [延迟ms]
-                formatted_tag = f"{ip_port}#{flag} {loc} - {colo} - [{delay}ms]"
-                
-                return {
-                    "entry": formatted_tag,
-                    "delay": delay
-                }
+        proxies = {
+            "http": f"http://{ip_port}",
+            "https": f"http://{ip_port}"
+        }
+        # 向公网 CDN 发起带 Cloudflare 标识的请求，测试代理中转能力
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Host": "1.1.1.1"
+        }
+        
+        # 建立代理连接，超时限制 2.5 秒
+        res = requests.get(
+            "http://1.1.1.1/cdn-cgi/trace", 
+            proxies=proxies, 
+            headers=headers, 
+            timeout=2.5
+        )
+        
+        # 成功响应且包含 CF 追踪特征，说明该 IP 具备良好的反代连通性
+        if res.status_code == 200 and "h=" in res.text:
+            ip = ip_port.rsplit(":", 1)[0].replace("[", "").replace("]", "")
+            return {"ip_port": ip_port, "ip": ip}
     except Exception:
         pass
     return None
 
-def update_cloudflare_kv(valid_items):
-    """把筛选出来的优质 IP 发送到 Cloudflare KV 存储"""
+def get_country_code(ip):
+    """获取 IP 地理位置信息"""
+    try:
+        res = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=2)
+        if res.status_code == 200:
+            return res.json().get("countryCode", "🌐")
+    except Exception:
+        pass
+    return "🌐"
+
+def get_flag_emoji(country_code):
+    if not country_code or len(country_code) != 2:
+        return "🌐"
+    return "".join(chr(127397 + ord(c)) for c in country_code.upper())
+
+def process_ip(ip_port):
+    result = check_cf_proxy_compatibility(ip_port)
+    if result:
+        country = get_country_code(result["ip"])
+        flag = get_flag_emoji(country)
+        formatted_entry = f"{ip_port}#{flag} {country} - [CF OK]"
+        return formatted_entry
+    return None
+
+def update_cloudflare_kv(valid_entries):
     kv_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/BEST_PROXY_IPS"
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
         "Content-Type": "text/plain; charset=utf-8"
     }
-    
-    content = "\n".join([item["entry"] for item in valid_items])
-    
+    content = "\n".join(valid_entries)
     res = requests.put(kv_url, data=content.encode('utf-8'), headers=headers)
     if res.status_code == 200:
-        print("成功把优质 IP 存储到 Cloudflare KV！")
+        print("🎉 成功存入 Cloudflare 兼容的高效落地 IP 库！")
     else:
-        print(f"写入 KV 失败，错误码: {res.status_code}，原因: {res.text}")
+        print(f"写入 KV 失败: {res.status_code} - {res.text}")
 
 def main():
     raw_ips = fetch_candidate_ips()
-    valid_items = []
+    valid_entries = []
     
-    print("开始多线程检测 IP 中...")
-    # 使用 20 个并发线程测试 IP
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        results = executor.map(check_ip, raw_ips)
+    print("🚀 开始在 GitHub 上模拟 Cloudflare 连通性测试...")
+    # 40 线程并发
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        results = executor.map(process_ip, raw_ips)
         for r in results:
             if r:
-                valid_items.append(r)
+                valid_entries.append(r)
                 
-    # 按延迟从小到大排序，只保留延迟最低的前 50 个 IP
-    valid_items.sort(key=lambda x: x["delay"])
-    best_ips = valid_items[:50]
+    print(f"测试完成！筛选出通过 CF 连通校验的 IP: {len(valid_entries)} 个")
     
-    print(f"检测完成！共找到 {len(valid_items)} 个活 IP，精选出前 {len(best_ips)} 个最佳 IP")
-    
-    if best_ips and CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN:
-        update_cloudflare_kv(best_ips)
-    else:
-        print("缺少必填的环境变量，或者没有找到有效的 IP，跳过 KV 写入。")
+    if valid_entries and CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN:
+        update_cloudflare_kv(valid_entries)
 
 if __name__ == "__main__":
     main()
