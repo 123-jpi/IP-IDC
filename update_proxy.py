@@ -3,6 +3,8 @@ import re
 import socket
 import random
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
 
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
@@ -15,6 +17,23 @@ CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 888
 PROXY_SOURCES = [
     "https://zip.cm.edu.kg/all.txt",
 ]
+
+def create_http_session():
+    """创建带有自动重试和连接池复用的 Session，规避网络抖动和请求限流"""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+# 全局复用 HTTP Session
+http_session = create_http_session()
 
 def clean_and_extract_ip(raw_text):
     """清洗源数据，提取标准的 IP:PORT"""
@@ -44,7 +63,7 @@ def fetch_candidate_ips():
     all_candidates = set()
     for url in PROXY_SOURCES:
         try:
-            res = requests.get(url, timeout=10)
+            res = http_session.get(url, timeout=10)
             if res.status_code == 200:
                 extracted = clean_and_extract_ip(res.text)
                 all_candidates.update(extracted)
@@ -54,18 +73,11 @@ def fetch_candidate_ips():
             
     total_count = len(all_candidates)
     print(f"全网池去重完成，共搜集到 {total_count} 个干净候选 IP！")
-    
-    # 随机抽样 500 个 IP 进行深度测试
-    test_size = min(total_count, 500)
-    sampled_list = random.sample(list(all_candidates), test_size)
-    print(f"🎲 随机抽取 {test_size} 个 IP 进行深度保活与 CF 官方地理识别测试...")
-    return sampled_list
+    return list(all_candidates)
 
 def check_keepalive_and_get_loc(ip_port):
-    """
-    通过 Socket 握手建立连接，并直接从 Cloudflare 探针响应中解析权威国家代码 loc=XX
-    不依赖任何第三方 IP 数据库，100% 准确且无请求限流
-    """
+    """ Socket 握手并检测 CF 探针 loc 信息（显式释放资源） """
+    sock = None
     try:
         if ip_port.startswith("["):
             ip = ip_port.rsplit("]:", 1)[0].replace("[", "")
@@ -77,10 +89,9 @@ def check_keepalive_and_get_loc(ip_port):
             family = socket.AF_INET
 
         sock = socket.socket(family, socket.SOCK_STREAM)
-        sock.settimeout(2.5)
+        sock.settimeout(2.0)  # 精简超时，提升 overall 速度
         sock.connect((ip, port))
 
-        # 向 1.1.1.1/cdn-cgi/trace 发送握手请求，触发 Cloudflare 返回包含 loc=XX 的信息
         probe = (
             f"GET /cdn-cgi/trace HTTP/1.1\r\n"
             f"Host: 1.1.1.1\r\n"
@@ -91,28 +102,31 @@ def check_keepalive_and_get_loc(ip_port):
         
         sock.sendall(probe.encode("utf-8"))
         response = sock.recv(1024).decode("utf-8", errors="ignore")
-        sock.close()
 
-        # 从 Cloudflare trace 数据中直接正则提取 loc=XX（如 loc=DE, loc=JP）
         if "loc=" in response:
             match = re.search(r'loc=([A-Z]{2})', response)
             if match:
                 country = match.group(1)
                 return {"ip_port": ip_port, "ip": ip, "country": country}
         elif response.startswith("HTTP/"):
-            # 如果没拿到 loc 但 HTTP 能连通，降级使用 IP-API 作为单次备用查询
             country = get_fallback_country(ip)
             if country != "UN":
                 return {"ip_port": ip_port, "ip": ip, "country": country}
 
     except Exception:
         pass
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return None
 
 def get_fallback_country(ip):
-    """备用查询逻辑"""
+    """备用查询逻辑 (复用 Session)"""
     try:
-        res = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=2)
+        res = http_session.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=2)
         if res.status_code == 200:
             country = res.json().get("countryCode")
             if country:
@@ -125,22 +139,57 @@ def process_ip(ip_port):
     result = check_keepalive_and_get_loc(ip_port)
     if result:
         country = result["country"]
-        
-        # 严格过滤：如果极端情况下依然没获取到国家（为 UN），直接丢弃该节点，确保输出质量
         if country == "UN":
             return None
-            
-        # 仅输出干净格式：IP:PORT#国家码
-        formatted_entry = f"{ip_port}#{country}"
-        return formatted_entry
+        return f"{ip_port}#{country}"
     return None
 
+def run_smart_testing(ip_pool, min_jp_target=3, target_total_sample=500, batch_size=80):
+    random.shuffle(ip_pool)
+    
+    tested_ips = set()
+    valid_entries = []
+    jp_count = 0
+
+    print(f"🎲 开始动态测试：计划完成基础测试 {target_total_sample} 个 IP，保底目标 JP 数量 >= {min_jp_target} 个...")
+
+    idx = 0
+    pool_len = len(ip_pool)
+
+    # 在 GitHub Actions 最佳实践中，线程数设为 25-30 能取得最佳的吞吐比与稳定度
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        while idx < pool_len:
+            if len(tested_ips) >= target_total_sample and jp_count >= min_jp_target:
+                print(f"🎉 目标达成！共测试 {len(tested_ips)} 个 IP，成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个。")
+                break
+
+            batch = ip_pool[idx : idx + batch_size]
+            idx += batch_size
+            
+            for ip in batch:
+                tested_ips.add(ip)
+
+            results = executor.map(process_ip, batch)
+            
+            for r in results:
+                if r:
+                    valid_entries.append(r)
+                    if r.endswith("#JP"):
+                        jp_count += 1
+
+            print(f"📊 进度: 已测试 {len(tested_ips)}/{pool_len} 个 IP | 成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个 (目标 ≥ {min_jp_target})")
+
+            if idx >= pool_len and jp_count < min_jp_target:
+                print(f"⚠️ 整个 IP 池已测试完毕！成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量仅为 {jp_count} 个 (未达到目标 {min_jp_target} 个)。")
+
+    return valid_entries
+
 def delete_old_kv():
-    """清除上一轮旧 KV，防止遗留失效 IP"""
+    """清除上一轮旧 KV"""
     kv_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/BEST_PROXY_IPS"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
     try:
-        requests.delete(kv_url, headers=headers)
+        http_session.delete(kv_url, headers=headers, timeout=10)
         print("🧹 已成功擦除上一轮旧的 KV 数据！")
     except Exception as e:
         print(f"⚠️ 清除旧 KV 状态: {e}")
@@ -154,7 +203,7 @@ def update_cloudflare_kv(valid_entries):
             "Content-Type": "text/plain; charset=utf-8"
         }
         content = "\n".join(valid_entries)
-        res = requests.put(kv_url, data=content.encode('utf-8'), headers=headers)
+        res = http_session.put(kv_url, data=content.encode('utf-8'), headers=headers, timeout=15)
         if res.status_code == 200:
             print(f"🎉 成功将格式化的 {len(valid_entries)} 个纯净落地 IP 写入 Cloudflare KV！")
         else:
@@ -163,17 +212,19 @@ def update_cloudflare_kv(valid_entries):
         print("⚠️ 本轮未测试出活 IP，KV 保持清空。")
 
 def main():
-    raw_ips = fetch_candidate_ips()
-    valid_entries = []
-    
-    print("🚀 开始进行【Socket 保活 + Cloudflare 官方地理位置识别】...")
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        results = executor.map(process_ip, raw_ips)
-        for r in results:
-            if r:
-                valid_entries.append(r)
-                
-    print(f"测试完成！共筛选出 {len(valid_entries)} 个高质量节点（已完全剔除 UN）")
+    raw_ip_pool = fetch_candidate_ips()
+    if not raw_ip_pool:
+        print("❌ 未抓取到任何有效 IP，程序退出。")
+        return
+
+    valid_entries = run_smart_testing(
+        ip_pool=raw_ip_pool,
+        min_jp_target=3,           # 最少 JP 节点数
+        target_total_sample=500,   # 基础抽样数
+        batch_size=80              # 适当减小单批测试量，降低瞬间并发压力
+    )
+        
+    print(f"\n✅ 全部流程完成！最终成功筛选出 {len(valid_entries)} 个高质量节点。")
     
     if CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN:
         update_cloudflare_kv(valid_entries)
