@@ -16,14 +16,15 @@ CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 888
 
 PROXY_SOURCES = [
     "https://zip.cm.edu.kg/all.txt",
+    "https://github.com/iplocate/free-proxy-list/blob/main/all-proxies.txt",
 ]
 
 def create_http_session():
-    """创建带有自动重试和连接池复用的 Session，规避网络抖动和请求限流"""
+    """创建复用连接池的 Session"""
     session = requests.Session()
     retries = Retry(
         total=3,
-        backoff_factor=0.5,
+        backoff_factor=0.3,
         status_forcelist=[429, 500, 502, 503, 504],
         raise_on_status=False
     )
@@ -32,7 +33,6 @@ def create_http_session():
     session.mount("https://", adapter)
     return session
 
-# 全局复用 HTTP Session
 http_session = create_http_session()
 
 def clean_and_extract_ip(raw_text):
@@ -63,7 +63,7 @@ def fetch_candidate_ips():
     all_candidates = set()
     for url in PROXY_SOURCES:
         try:
-            res = http_session.get(url, timeout=10)
+            res = http_session.get(url, timeout=8)
             if res.status_code == 200:
                 extracted = clean_and_extract_ip(res.text)
                 all_candidates.update(extracted)
@@ -76,7 +76,7 @@ def fetch_candidate_ips():
     return list(all_candidates)
 
 def check_keepalive_and_get_loc(ip_port):
-    """ Socket 握手并检测 CF 探针 loc 信息（显式释放资源） """
+    """ Socket 极致提速检测（1.2s 超时） """
     sock = None
     try:
         if ip_port.startswith("["):
@@ -89,7 +89,7 @@ def check_keepalive_and_get_loc(ip_port):
             family = socket.AF_INET
 
         sock = socket.socket(family, socket.SOCK_STREAM)
-        sock.settimeout(2.0)  # 精简超时，提升 overall 速度
+        sock.settimeout(1.2)  # 压缩至 1.2s，丢弃高延迟/卡死的假活节点
         sock.connect((ip, port))
 
         probe = (
@@ -124,9 +124,9 @@ def check_keepalive_and_get_loc(ip_port):
     return None
 
 def get_fallback_country(ip):
-    """备用查询逻辑 (复用 Session)"""
+    """备用查询逻辑"""
     try:
-        res = http_session.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=2)
+        res = http_session.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=1.5)
         if res.status_code == 200:
             country = res.json().get("countryCode")
             if country:
@@ -144,23 +144,30 @@ def process_ip(ip_port):
         return f"{ip_port}#{country}"
     return None
 
-def run_smart_testing(ip_pool, min_jp_target=3, target_total_sample=500, batch_size=80):
+def run_fast_target_testing(ip_pool, min_total_target=80, max_total_target=100, min_jp_target=3, batch_size=40):
+    """
+    极速目标驱动逻辑：
+    只要 80 <= 有效节点 <= 100 且 JP >= 3，立刻终止，绝不浪费时间！
+    """
     random.shuffle(ip_pool)
     
     tested_ips = set()
     valid_entries = []
     jp_count = 0
 
-    print(f"🎲 开始动态测试：计划完成基础测试 {target_total_sample} 个 IP，保底目标 JP 数量 >= {min_jp_target} 个...")
+    print(f"🚀 开始极速测试：目标搜集 {min_total_target}~{max_total_target} 个有效节点，且其中包含 JP >= {min_jp_target} 个...")
 
     idx = 0
     pool_len = len(ip_pool)
 
-    # 在 GitHub Actions 最佳实践中，线程数设为 25-30 能取得最佳的吞吐比与稳定度
-    with ThreadPoolExecutor(max_workers=30) as executor:
+    # 40 个并发搭配 1.2s 超时，能在几秒内消化完一个 Batch
+    with ThreadPoolExecutor(max_workers=40) as executor:
         while idx < pool_len:
-            if len(tested_ips) >= target_total_sample and jp_count >= min_jp_target:
-                print(f"🎉 目标达成！共测试 {len(tested_ips)} 个 IP，成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个。")
+            current_valid_count = len(valid_entries)
+            
+            # 退出条件：达到了最少目标量(80+) 并且 JP 节点已凑满 3 个；或者总数已达上限(100)
+            if (current_valid_count >= min_total_target and jp_count >= min_jp_target) or current_valid_count >= max_total_target:
+                print(f"\n🎯 目标达成，立即停止！共检测 {len(tested_ips)} 个 IP，成功捕获有效节点 {current_valid_count} 个，其中 JP 数量为 {jp_count} 个。")
                 break
 
             batch = ip_pool[idx : idx + batch_size]
@@ -177,10 +184,10 @@ def run_smart_testing(ip_pool, min_jp_target=3, target_total_sample=500, batch_s
                     if r.endswith("#JP"):
                         jp_count += 1
 
-            print(f"📊 进度: 已测试 {len(tested_ips)}/{pool_len} 个 IP | 成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个 (目标 ≥ {min_jp_target})")
+            print(f"📊 进度: 已测试 {len(tested_ips)} 个 IP | 成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个 (目标 ≥ {min_jp_target})")
 
-            if idx >= pool_len and jp_count < min_jp_target:
-                print(f"⚠️ 整个 IP 池已测试完毕！成功捕获有效节点 {len(valid_entries)} 个，其中 JP 数量仅为 {jp_count} 个 (未达到目标 {min_jp_target} 个)。")
+            if idx >= pool_len:
+                print(f"⚠️ 整个 IP 池已全部测试完毕！共筛选出有效节点 {len(valid_entries)} 个，其中 JP 数量为 {jp_count} 个。")
 
     return valid_entries
 
@@ -189,7 +196,7 @@ def delete_old_kv():
     kv_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/BEST_PROXY_IPS"
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
     try:
-        http_session.delete(kv_url, headers=headers, timeout=10)
+        http_session.delete(kv_url, headers=headers, timeout=8)
         print("🧹 已成功擦除上一轮旧的 KV 数据！")
     except Exception as e:
         print(f"⚠️ 清除旧 KV 状态: {e}")
@@ -203,7 +210,7 @@ def update_cloudflare_kv(valid_entries):
             "Content-Type": "text/plain; charset=utf-8"
         }
         content = "\n".join(valid_entries)
-        res = http_session.put(kv_url, data=content.encode('utf-8'), headers=headers, timeout=15)
+        res = http_session.put(kv_url, data=content.encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
             print(f"🎉 成功将格式化的 {len(valid_entries)} 个纯净落地 IP 写入 Cloudflare KV！")
         else:
@@ -217,14 +224,16 @@ def main():
         print("❌ 未抓取到任何有效 IP，程序退出。")
         return
 
-    valid_entries = run_smart_testing(
+    # 调高效率逻辑，达到目标直接 Exit
+    valid_entries = run_fast_target_testing(
         ip_pool=raw_ip_pool,
-        min_jp_target=3,           # 最少 JP 节点数
-        target_total_sample=500,   # 基础抽样数
-        batch_size=80              # 适当减小单批测试量，降低瞬间并发压力
+        min_total_target=80,        # 搜集到 80 个活节点即可准备退出
+        max_total_target=100,       # 上限 100 个
+        min_jp_target=3,            # 保底 3 个 JP 节点
+        batch_size=40               # 小批次快速响应退出条件
     )
         
-    print(f"\n✅ 全部流程完成！最终成功筛选出 {len(valid_entries)} 个高质量节点。")
+    print(f"\n✅ 全部流程完成！最终输出 {len(valid_entries)} 个高质量节点。")
     
     if CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN:
         update_cloudflare_kv(valid_entries)
