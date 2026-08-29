@@ -16,7 +16,6 @@ CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 888
 
 PROXY_SOURCES = [
     "https://zip.cm.edu.kg/all.txt",
-    "https://github.com/iplocate/free-proxy-list/blob/main/all-proxies.txt",
 ]
 
 def create_http_session():
