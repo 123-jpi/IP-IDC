@@ -2,12 +2,23 @@ name: Auto Scan Proxy IPs
 
 on:
   schedule:
-    - cron: '0 */12 * * *'  # 每 12 小时定时自动跑一次
-  workflow_dispatch:        # 支持手动点按 Run Workflow
+    # 24小时触发一次（每天 UTC 00:00，即北京时间 08:00 运行）
+    - cron: '0 0 * * *'
+    # 如果想改为 48 小时跑一次，请注释上一行，启用下面这行：
+    # - cron: '0 0 */2 * *'
+    
+  workflow_dispatch: # 支持手动触发测试
+
+# 核心优化 1：并发控制！手动连续多次点击运行，会自动取消旧任务，防止 KV 覆盖冲突与浪费额度
+concurrency:
+  group: auto-scan-proxy
+  cancel-in-progress: true
 
 jobs:
   run-python:
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # 核心优化 2：设置 5 分钟超时，防止因网络阻塞拖累 Actions 免费额度
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v4.2.2
@@ -16,9 +27,10 @@ jobs:
         uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
+          cache: 'pip' # 核心优化 3：开启 pip 缓存，进一步加快部署时间
 
       - name: 安装依赖包
-        run: pip install requests
+        run: pip install requests urllib3
 
       - name: 执行测试与更新
         env:
