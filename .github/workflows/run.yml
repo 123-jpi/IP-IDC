@@ -2,7 +2,7 @@ name: Auto Scan Proxy IPs
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # 每 6 小时定时自动跑一次
+    - cron: '0 */12 * * *'  # 每 12 小时定时自动跑一次
   workflow_dispatch:        # 支持手动点按 Run Workflow
 
 jobs:
