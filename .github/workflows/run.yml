@@ -27,10 +27,11 @@ jobs:
         uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.10'
-          cache: 'pip' # 核心优化 3：开启 pip 缓存，进一步加快部署时间
+          cache: 'pip' # 此时保留 pip 缓存，setup-python 会自动查找 requirements.txt
 
       - name: 安装依赖包
-        run: pip install requests urllib3
+        # 修改点：从 requirements.txt 读取并安装依赖
+        run: pip install -r requirements.txt
 
       - name: 执行测试与更新
         env:
