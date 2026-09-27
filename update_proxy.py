@@ -34,16 +34,16 @@ for cont, countries in CONTINENT_MAP.items():
     for c in countries:
         COUNTRY_TO_CONTINENT[c] = cont
 
-# ----------------- 重构后的配额结构 (以 JP 为绝对核心) -----------------
+# ----------------- 调整后的配额结构 (重质不重量 + GB提升) -----------------
 PRIMARY_LIMITS = {
-    "JP": 35,  # 提升日本节点配额，主攻电信硬扛与移动直连
-    "SG": 20,  # 亚太主力 2
-    "HK": 15,  # 亚太主力 3
-    "US": 10,  # 美洲长尾备用
-    "GB": 5,   # 欧洲长尾备用
+    "JP": 15,  # 宁缺毋滥，精选 15 个高质日本 IP
+    "SG": 15,  # 亚太主力
+    "HK": 10,  # 亚太主力
+    "US": 10,  # 美洲主力
+    "GB": 10,  # 欧洲主力（已提升）
 }
 MAX_TOTAL_RESULTS = 100
-REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 15 个名额给各大洲保底与随机补充
+REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 34 个名额给大洲保底与池子动态填充
 
 def get_continent(country):
     return COUNTRY_TO_CONTINENT.get(country, "UNKNOWN")
@@ -107,25 +107,25 @@ def fetch_extract_clean_and_sample():
         random.shuffle(node_list)
 
         cont = get_continent(country)
-        # 加大 JP/SG/HK 的抽样基数，确保选出最优质节点
+        # 大基数抽样：JP 虽只取 15 个，但仍从 180 个样本中挑选，实现更高筛选比
         if country == "JP":
             sample_size = 180
-        elif country in {"SG", "HK", "US"}:
+        elif country in {"SG", "HK", "US", "GB"}:
             sample_size = 80
         elif cont in {"AF", "SA", "OC"}:
             sample_size = 20
         else:
-            sample_size = 10
+            sample_size = 15
 
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入连通性与抗 QoS 测试")
+    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入连通性与质量测试")
     return sampled_pool
 
 def check_keepalive(item):
     """
-    针对 JP 进行 3 次严格探针探测，剔除伪低延迟的高丢包节点
+    针对 JP 进行 3 轮严格探针测试，剔除高丢包与虚假低延迟节点
     """
     ip_port, raw_country = item.rsplit("#", 1)
     
@@ -141,7 +141,7 @@ def check_keepalive(item):
     latencies = []
     real_country = raw_country
     
-    # 日本节点开启 3 轮严格测试（防电信 QoS 丢包）；其他地区 2 轮测试
+    # JP 节点开启 3 轮严格测试；其他地区 2 轮测试
     rounds = 3 if raw_country == "JP" else 2
     timeout_val = 1.3 if raw_country == "JP" else 1.6
 
@@ -165,14 +165,14 @@ def check_keepalive(item):
                     if detected_loc != "UN":
                         real_country = "GB" if detected_loc == "UK" else detected_loc
             else:
-                return None  # 只要有一次丢包/超时，直接丢弃
+                return None  # 任何一次丢包/超时直接淘汰
 
         avg_latency = round(sum(latencies) / len(latencies), 2)
 
-        # 排序积分：优先照顾移动 CMI 和电信硬扛的 JP/HK/SG 节点
+        # 评分机制：极低延迟与 JP/亚太节点获得优先权
         score = avg_latency
         if real_country == "JP":
-            score -= 20  # 日本节点获得最高优选权重
+            score -= 20
         elif real_country in {"HK", "SG"}:
             score -= 10
 
@@ -190,7 +190,7 @@ def check_keepalive(item):
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
     
-    print(f"🚀 [阶段 3: 并发测试与日本/亚太倾斜评估] 启动检测 (线程数: 40)...")
+    print(f"🚀 [阶段 3: 并发测试与质量评估] 启动检测 (线程数: 40)...")
     
     valid_results = []
     with ThreadPoolExecutor(max_workers=40) as executor:
@@ -200,7 +200,7 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
             if res:
                 valid_results.append(res)
 
-    # 按照抗 QoS 综合得分（Score）排序
+    # 按照综合质量得分（Score）升序排序
     valid_results.sort(key=lambda x: x["score"])
 
     # 分组存储
@@ -218,18 +218,18 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
         else:
             other_by_continent[cont].append(entry)
 
-    # ------------ 核心大洲覆盖算法 (保底 6 大洲均有节点) ------------
+    # ------------ 核心大洲覆盖与池子动态分配算法 ------------
     other_selected = []
     all_continents = ["AS", "EU", "NA", "SA", "AF", "OC"]
 
-    # 1. 第一轮：在非主要地区中，强制选 1 个节点给各大洲保底
+    # 1. 强制在各大洲的非主要国家中抽取 1 个节点保底（保障全球覆盖）
     for cont in all_continents:
         if other_by_continent[cont]:
             chosen = random.choice(other_by_continent[cont])
             other_selected.append(chosen)
             other_by_continent[cont].remove(chosen)
 
-    # 2. 第二轮：剩余名额从所有非主要地区的可用节点中随机打散填充
+    # 2. 剩余 28 个名额从池子中所有非主要地区节点里打散填充
     remaining_pool = []
     for cont, nodes in other_by_continent.items():
         remaining_pool.extend(nodes)
@@ -241,22 +241,21 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
 
     # 汇总最终结果
     final_entries = []
-    for c in ["JP", "SG", "HK", "US", "GB"]:  # 按照权重顺序排列
+    for c in ["JP", "SG", "HK", "GB", "US"]:
         final_entries.extend(primary_buckets[c])
     final_entries.extend(other_selected)
 
     final_entries = final_entries[:max_total]
     duration = round(time.time() - start_time, 2)
 
-    # 统计各大洲覆盖情况
+    # 统计各大洲分布
     continent_counts = defaultdict(int)
     for entry in final_entries:
         ct = entry.rsplit("#", 1)[-1]
         continent_counts[get_continent(ct)] += 1
 
     print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 写入节点: {len(final_entries)} 个")
-    print(f"🇯🇵 主力日本 (JP): {len(primary_buckets['JP'])}/35 | 🇸🇬 新加坡 (SG): {len(primary_buckets['SG'])}/20 | 🇭🇰 香港 (HK): {len(primary_buckets['HK'])}/15")
-    print(f"🇺🇸 美国 (US): {len(primary_buckets['US'])}/10 | 🇬🇧 英国 (GB): {len(primary_buckets['GB'])}/5")
+    print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/10 | GB: {len(primary_buckets['GB'])}/10 | US: {len(primary_buckets['US'])}/10")
     print(f"🌍 6大洲分布 -> 亚洲(AS): {continent_counts['AS']} | 欧洲(EU): {continent_counts['EU']} | 北美(NA): {continent_counts['NA']} | 南美(SA): {continent_counts['SA']} | 非洲(AF): {continent_counts['AF']} | 大洋洲(OC): {continent_counts['OC']}")
 
     return final_entries
@@ -279,7 +278,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=30):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！已更新 35+ 个日本与亚太硬核 IP。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已更新 15 个精选 JP 及 85 个全球优质 IP。")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
