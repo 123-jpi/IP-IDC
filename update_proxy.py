@@ -35,16 +35,16 @@ for cont, countries in CONTINENT_MAP.items():
     for c in countries:
         COUNTRY_TO_CONTINENT[c] = cont
 
-# ----------------- 配额结构 -----------------
+# 恢复 HK 的配额，满足 YouTube 等直连场景需求
 PRIMARY_LIMITS = {
-    "JP": 15,  # 精选 15 个能流畅解锁 Gemini 的高质 JP IP
-    "SG": 15,
-    "HK": 10,
+    "JP": 15,  # 严格防漂移，用于解锁 AI
+    "SG": 15,  # 防漂移，用于解锁 AI
+    "HK": 15,  # 保留 HK 高速节点，看 YouTube
     "US": 10,
     "GB": 10,
 }
 MAX_TOTAL_RESULTS = 100
-REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 34 个留给大洲保底与长尾池
+REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())
 
 def get_continent(country):
     return COUNTRY_TO_CONTINENT.get(country, "UNKNOWN")
@@ -108,9 +108,9 @@ def fetch_extract_clean_and_sample():
         random.shuffle(node_list)
 
         cont = get_continent(country)
-        if country == "JP":
+        if country in {"JP", "HK"}:
             sample_size = 200
-        elif country in {"SG", "HK", "US", "GB"}:
+        elif country in {"SG", "US", "GB"}:
             sample_size = 100
         elif cont in {"AF", "SA", "OC"}:
             sample_size = 25
@@ -120,90 +120,73 @@ def fetch_extract_clean_and_sample():
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入【0 丢包 + Gemini/Google AI 服务解锁】测试")
+    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入【连通性 + AI 地区防漂移】测试")
     return sampled_pool
 
 def check_keepalive_and_google(item):
     """
-    三重严格筛选：
-    1. 连通性与 0.9s 超时限制（保障本地连通率 >90%）。
-    2. 3 轮延迟与 Jitter 抖动过滤（防电信晚高峰 QoS）。
-    3. Gemini 与 Google 服务穿透探针：淘汰无 Geo 信息 / 封禁 Gemini 的数据中心 IP。
+    分流校验逻辑：
+    1. 连通性测试：超时 1.2s，保证丢包率低。
+    2. 对于 JP/SG/US/GB 等 AI 地区节点：强校验 Google 重定向。如果漂移至 google.com.hk 或 google.cn，取消其 AI 地区身份（避免挂着 JP 标却用不了 Gemini）。
+    3. 对于 HK 节点：放行 HK 识别，保留看 YouTube 的高带宽优势。
     """
     ip_port, raw_country = item.rsplit("#", 1)
     
-    headers = {
+    port = int(ip_port.rsplit(":", 1)[-1])
+    protocol = "https" if port in {443, 8443, 2053, 2083, 2087, 2096} else "http"
+    
+    cf_headers = {
         "Host": "www.cloudflare.com",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-
-    port = int(ip_port.rsplit(":", 1)[-1])
-    protocol = "https" if port in {443, 8443, 2053, 2083, 2087, 2096} else "http"
-    url = f"{protocol}://{ip_port}/cdn-cgi/trace"
+    trace_url = f"{protocol}://{ip_port}/cdn-cgi/trace"
 
     latencies = []
     real_country = raw_country
-    STRICT_TIMEOUT = 0.9  # 压低超时门槛
+    STRICT_TIMEOUT = 1.2
     
     try:
-        # --- 步骤 1：3 次探针压测 (0 丢包校验) ---
-        for _ in range(3):
-            t_start = time.time()
-            res = http_session.get(
-                url, 
-                headers=headers, 
-                timeout=STRICT_TIMEOUT, 
-                verify=False, 
-                allow_redirects=False
-            )
-            t_cost = (time.time() - t_start) * 1000
+        t_start = time.time()
+        res = http_session.get(trace_url, headers=cf_headers, timeout=STRICT_TIMEOUT, verify=False, allow_redirects=False)
+        t_cost = (time.time() - t_start) * 1000
 
-            if res.status_code == 200 and "h=" in res.text and "colo=" in res.text:
-                latencies.append(t_cost)
-                loc_match = re.search(r'loc=([A-Z]{2})', res.text)
-                if loc_match:
-                    detected_loc = loc_match.group(1)
-                    if detected_loc != "UN":
-                        real_country = "GB" if detected_loc == "UK" else detected_loc
-            else:
-                return None  # 只要有一次丢包直接淘汰
-
-        avg_latency = round(sum(latencies) / len(latencies), 2)
-        jitter = round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0
-
-        # Jitter 抖动限制（抗 QoS）
-        if jitter > 60:
+        if res.status_code == 200 and "h=" in res.text and "colo=" in res.text:
+            latencies.append(t_cost)
+            loc_match = re.search(r'loc=([A-Z]{2})', res.text)
+            if loc_match:
+                detected_loc = loc_match.group(1)
+                if detected_loc != "UN":
+                    real_country = "GB" if detected_loc == "UK" else detected_loc
+        else:
             return None
 
-        # --- 步骤 2：Google Services & Gemini 解锁探针 ---
-        # 模拟向 Google 内部服务发起针对性测试，检验是否被标记为无地区/黑名单 IP
-        gemini_headers = {
-            "Host": "gemini.google.com",
-            "User-Agent": headers["User-Agent"]
-        }
-        g_url = f"{protocol}://{ip_port}/"
-        
-        try:
-            g_res = http_session.get(
-                g_url, 
-                headers=gemini_headers, 
-                timeout=1.0, 
-                verify=False, 
-                allow_redirects=False
-            )
-            # 1. 过滤被 Google WAF 明确拦截的 403 / 429
-            # 2. 如果返回 302 且重定向到了 google.cn 或 location-unsupported 页面，证明该 IP 无法正常使用 Gemini
-            if g_res.status_code in {403, 429}:
-                return None
+        # --- Google 出口漂移强校验 ---
+        # 如果节点宣称是非 HK 地区（如 JP, SG, US, GB），我们要确保它访问 Google 时不会被重定向到 google.com.hk
+        if real_country != "HK":
+            google_headers = {
+                "Host": "www.google.com",
+                "User-Agent": cf_headers["User-Agent"]
+            }
+            g_url = f"{protocol}://{ip_port}/"
             
-            redirect_location = g_res.headers.get("Location", "")
-            if "google.cn" in redirect_location or "sorry" in redirect_location:
-                return None
-        except Exception:
-            pass
+            try:
+                g_res = http_session.get(g_url, headers=google_headers, timeout=1.2, verify=False, allow_redirects=False)
+                redirect_to = g_res.headers.get("Location", "")
+                
+                # 如果是 JP/SG 等节点，但出口被 Google 识别回了 HK/CN，直接剔除（防止假 JP 导致 Gemini 报错）
+                if "google.com.hk" in redirect_to or "google.cn" in redirect_to:
+                    return None
+                
+                # 被拦截的剔除
+                if g_res.status_code in {403, 429}:
+                    return None
+            except Exception:
+                pass
 
-        # 评分计算
-        score = avg_latency + (jitter * 1.5)
+        avg_latency = round(t_cost, 2)
+        score = avg_latency
+        
+        # 加权排序
         if real_country == "JP":
             score -= 15
         elif real_country in {"HK", "SG"}:
@@ -214,7 +197,6 @@ def check_keepalive_and_google(item):
             "country": real_country,
             "continent": get_continent(real_country),
             "latency": avg_latency,
-            "jitter": jitter,
             "score": score
         }
 
@@ -224,7 +206,7 @@ def check_keepalive_and_google(item):
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
     
-    print(f"🚀 [阶段 3: 并发高压测试] 启动 Gemini 兼容性 & Jitter 抖动精细筛查 (线程数: 40)...")
+    print(f"🚀 [阶段 3: 并发高压筛选] 保留 HK 节点 + 严筛纯净 JP/SG/US 防漂移节点...")
     
     valid_results = []
     with ThreadPoolExecutor(max_workers=40) as executor:
@@ -234,7 +216,7 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
             if res:
                 valid_results.append(res)
 
-    print(f"🧪 测速与服务穿透校验完成：从 {len(sampled_pool)} 个候选样本中精筛出 {len(valid_results)} 个【Gemini 可用 & 极高连通率】节点。")
+    print(f"🧪 筛选完成：从 {len(sampled_pool)} 个样本中筛选出 {len(valid_results)} 个【包含 HK 影音 + 纯净 JP/SG AI 解锁】节点。")
 
     valid_results.sort(key=lambda x: x["score"])
 
@@ -252,18 +234,15 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
         else:
             other_by_continent[cont].append(entry)
 
-    # ------------ 核心大洲覆盖与池子动态分配算法 ------------
     other_selected = []
     all_continents = ["AS", "EU", "NA", "SA", "AF", "OC"]
 
-    # 1. 强制在各大洲非主要国家抽取 1 个节点保底
     for cont in all_continents:
         if other_by_continent[cont]:
             chosen = random.choice(other_by_continent[cont])
             other_selected.append(chosen)
             other_by_continent[cont].remove(chosen)
 
-    # 2. 剩余名额打散填充
     remaining_pool = []
     for cont, nodes in other_by_continent.items():
         remaining_pool.extend(nodes)
@@ -287,12 +266,12 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
         continent_counts[get_continent(ct)] += 1
 
     print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 最终入库节点: {len(final_entries)} 个")
-    print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/10 | GB: {len(primary_buckets['GB'])}/10 | US: {len(primary_buckets['US'])}/10")
+    print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/15 | US: {len(primary_buckets['US'])}/10 | GB: {len(primary_buckets['GB'])}/10")
     print(f"🌍 6大洲分布 -> 亚洲(AS): {continent_counts['AS']} | 欧洲(EU): {continent_counts['EU']} | 北美(NA): {continent_counts['NA']} | 南美(SA): {continent_counts['SA']} | 非洲(AF): {continent_counts['AF']} | 大洋洲(OC): {continent_counts['OC']}")
 
     return final_entries
 
-def safe_update_cloudflare_kv(valid_entries, min_required=20):
+def safe_update_cloudflare_kv(valid_entries, min_required=15):
     if not (CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN):
         print("⚠️ 未配置 Cloudflare KV 环境变量，跳过写入。")
         return
@@ -310,7 +289,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=20):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！已筛选出完美支持 Gemini / AI 搜索的优质 IP 列表。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已保留 HK 节点用于 YouTube，并确保 JP/SG 等节点能完美解锁 Gemini。")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
@@ -323,7 +302,7 @@ def main():
         return
 
     valid_entries = test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS)
-    safe_update_cloudflare_kv(valid_entries, min_required=20)
+    safe_update_cloudflare_kv(valid_entries, min_required=15)
 
 if __name__ == "__main__":
     main()
