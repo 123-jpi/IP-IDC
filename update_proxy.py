@@ -2,7 +2,6 @@ import os
 import re
 import time
 import random
-import statistics
 import requests
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
@@ -18,6 +17,8 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 
 # Cloudflare 支持的反代端口
 CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 8880}
+
+# 拥有上万 IP 的优质源
 PROXY_SOURCES = ["https://zip.cm.edu.kg/all.txt"]
 
 # ----------------- 大洲与国家代码映射表 -----------------
@@ -35,11 +36,10 @@ for cont, countries in CONTINENT_MAP.items():
     for c in countries:
         COUNTRY_TO_CONTINENT[c] = cont
 
-# 恢复 HK 的配额，满足 YouTube 等直连场景需求
 PRIMARY_LIMITS = {
-    "JP": 15,  # 严格防漂移，用于解锁 AI
-    "SG": 15,  # 防漂移，用于解锁 AI
-    "HK": 15,  # 保留 HK 高速节点，看 YouTube
+    "JP": 15,  # 确保选出优质 JP
+    "SG": 15,  # 确保选出优质 SG
+    "HK": 15,  # 保留 HK 供 YouTube 使用
     "US": 10,
     "GB": 10,
 }
@@ -51,7 +51,7 @@ def get_continent(country):
 
 def create_http_session():
     session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=60, pool_maxsize=60)
+    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -67,7 +67,7 @@ def fetch_extract_clean_and_sample():
 
     for url in PROXY_SOURCES:
         try:
-            res = http_session.get(url, timeout=10)
+            res = http_session.get(url, timeout=15)
             if res.status_code != 200:
                 continue
 
@@ -100,123 +100,78 @@ def fetch_extract_clean_and_sample():
         except Exception as e:
             print(f"⚠️ 抓取源失败 {url}: {e}")
 
-    print(f"🔍 [阶段 1: 清洗] 原始数据 {total_raw_count} 行 | 有效端口 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
+    print(f"🔍 [阶段 1: 解析抽取] 原始总行数 {total_raw_count} | 匹配有效端口 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
 
     sampled_pool = []
+    # 抽取 150 个 JP 节点进行延迟测试
     for country, nodes in raw_by_country.items():
         node_list = list(nodes)
         random.shuffle(node_list)
 
-        cont = get_continent(country)
-        if country in {"JP", "HK"}:
-            sample_size = 200
-        elif country in {"SG", "US", "GB"}:
-            sample_size = 100
-        elif cont in {"AF", "SA", "OC"}:
-            sample_size = 25
+        if country in {"JP", "SG", "HK", "US", "GB"}:
+            sample_size = 150
         else:
-            sample_size = 20
+            sample_size = 30
 
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入【连通性 + AI 地区防漂移】测试")
+    print(f"🎯 [阶段 2: 样本分配] 已抽取 {len(sampled_pool)} 个真实地区样本（其中包含 JP: {len([x for x in sampled_pool if x.endswith('#JP')])} 个）")
     return sampled_pool
 
-def check_keepalive_and_google(item):
-    """
-    分流校验逻辑：
-    1. 连通性测试：超时 1.2s，保证丢包率低。
-    2. 对于 JP/SG/US/GB 等 AI 地区节点：强校验 Google 重定向。如果漂移至 google.com.hk 或 google.cn，取消其 AI 地区身份（避免挂着 JP 标却用不了 Gemini）。
-    3. 对于 HK 节点：放行 HK 识别，保留看 YouTube 的高带宽优势。
-    """
-    ip_port, raw_country = item.rsplit("#", 1)
+def check_keepalive(item):
+    ip_port, country = item.rsplit("#", 1)
     
     port = int(ip_port.rsplit(":", 1)[-1])
     protocol = "https" if port in {443, 8443, 2053, 2083, 2087, 2096} else "http"
     
     cf_headers = {
         "Host": "www.cloudflare.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     trace_url = f"{protocol}://{ip_port}/cdn-cgi/trace"
 
-    latencies = []
-    real_country = raw_country
-    STRICT_TIMEOUT = 1.2
-    
     try:
         t_start = time.time()
-        res = http_session.get(trace_url, headers=cf_headers, timeout=STRICT_TIMEOUT, verify=False, allow_redirects=False)
+        res = http_session.get(trace_url, headers=cf_headers, timeout=1.5, verify=False, allow_redirects=False)
         t_cost = (time.time() - t_start) * 1000
 
-        if res.status_code == 200 and "h=" in res.text and "colo=" in res.text:
-            latencies.append(t_cost)
-            loc_match = re.search(r'loc=([A-Z]{2})', res.text)
-            if loc_match:
-                detected_loc = loc_match.group(1)
-                if detected_loc != "UN":
-                    real_country = "GB" if detected_loc == "UK" else detected_loc
-        else:
-            return None
-
-        # --- Google 出口漂移强校验 ---
-        # 如果节点宣称是非 HK 地区（如 JP, SG, US, GB），我们要确保它访问 Google 时不会被重定向到 google.com.hk
-        if real_country != "HK":
-            google_headers = {
-                "Host": "www.google.com",
-                "User-Agent": cf_headers["User-Agent"]
-            }
-            g_url = f"{protocol}://{ip_port}/"
+        if res.status_code == 200 and "h=" in res.text:
+            avg_latency = round(t_cost, 2)
+            score = avg_latency
             
-            try:
-                g_res = http_session.get(g_url, headers=google_headers, timeout=1.2, verify=False, allow_redirects=False)
-                redirect_to = g_res.headers.get("Location", "")
-                
-                # 如果是 JP/SG 等节点，但出口被 Google 识别回了 HK/CN，直接剔除（防止假 JP 导致 Gemini 报错）
-                if "google.com.hk" in redirect_to or "google.cn" in redirect_to:
-                    return None
-                
-                # 被拦截的剔除
-                if g_res.status_code in {403, 429}:
-                    return None
-            except Exception:
-                pass
+            # JP/SG/US 给予优先倾斜
+            if country == "JP":
+                score -= 15
+            elif country in {"SG", "US"}:
+                score -= 10
 
-        avg_latency = round(t_cost, 2)
-        score = avg_latency
-        
-        # 加权排序
-        if real_country == "JP":
-            score -= 15
-        elif real_country in {"HK", "SG"}:
-            score -= 10
-
-        return {
-            "entry": f"{ip_port}#{real_country}",
-            "country": real_country,
-            "continent": get_continent(real_country),
-            "latency": avg_latency,
-            "score": score
-        }
-
+            return {
+                "entry": f"{ip_port}#{country}",
+                "country": country,
+                "continent": get_continent(country),
+                "latency": avg_latency,
+                "score": score
+            }
     except Exception:
-        return None
+        pass
+
+    return None
 
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
     
-    print(f"🚀 [阶段 3: 并发高压筛选] 保留 HK 节点 + 严筛纯净 JP/SG/US 防漂移节点...")
+    print(f"🚀 [阶段 3: 并发筛选] 正在挑选高响应节点...")
     
     valid_results = []
-    with ThreadPoolExecutor(max_workers=40) as executor:
-        futures = [executor.submit(check_keepalive_and_google, item) for item in sampled_pool]
+    with ThreadPoolExecutor(max_workers=60) as executor:
+        futures = [executor.submit(check_keepalive, item) for item in sampled_pool]
         for future in futures:
             res = future.result()
             if res:
                 valid_results.append(res)
 
-    print(f"🧪 筛选完成：从 {len(sampled_pool)} 个样本中筛选出 {len(valid_results)} 个【包含 HK 影音 + 纯净 JP/SG AI 解锁】节点。")
+    print(f"🧪 测试完成：从 {len(sampled_pool)} 个样本中测出 {len(valid_results)} 个高响应节点。")
 
     valid_results.sort(key=lambda x: x["score"])
 
@@ -267,7 +222,6 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
 
     print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 最终入库节点: {len(final_entries)} 个")
     print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/15 | US: {len(primary_buckets['US'])}/10 | GB: {len(primary_buckets['GB'])}/10")
-    print(f"🌍 6大洲分布 -> 亚洲(AS): {continent_counts['AS']} | 欧洲(EU): {continent_counts['EU']} | 北美(NA): {continent_counts['NA']} | 南美(SA): {continent_counts['SA']} | 非洲(AF): {continent_counts['AF']} | 大洋洲(OC): {continent_counts['OC']}")
 
     return final_entries
 
@@ -289,7 +243,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=15):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！已保留 HK 节点用于 YouTube，并确保 JP/SG 等节点能完美解锁 Gemini。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已保留 HK 看 YouTube，并配齐 JP/SG 解锁 Gemini。")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
