@@ -18,10 +18,9 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 # Cloudflare 支持的反代端口
 CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 8880}
 
-# 拥有上万 IP 的优质源
+# 源地址
 PROXY_SOURCES = ["https://zip.cm.edu.kg/all.txt"]
 
-# ----------------- 大洲与国家代码映射表 -----------------
 CONTINENT_MAP = {
     "AS": {"JP", "HK", "SG", "IN", "KR", "TW", "TH", "VN", "MY", "PH", "ID", "AE", "KH", "PK", "TR"},
     "EU": {"GB", "DE", "FR", "NL", "FI", "IT", "ES", "SE", "PL", "RO", "CH", "AT", "CZ", "UA", "RU", "NO", "DK"},
@@ -37,9 +36,9 @@ for cont, countries in CONTINENT_MAP.items():
         COUNTRY_TO_CONTINENT[c] = cont
 
 PRIMARY_LIMITS = {
-    "JP": 15,  # 确保选出优质 JP
-    "SG": 15,  # 确保选出优质 SG
-    "HK": 15,  # 保留 HK 供 YouTube 使用
+    "JP": 15,
+    "SG": 15,
+    "HK": 15,
     "US": 10,
     "GB": 10,
 }
@@ -100,10 +99,9 @@ def fetch_extract_clean_and_sample():
         except Exception as e:
             print(f"⚠️ 抓取源失败 {url}: {e}")
 
-    print(f"🔍 [阶段 1: 解析抽取] 原始总行数 {total_raw_count} | 匹配有效端口 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
+    print(f"🔍 [阶段 1: 解析抽取] 原始总行数 {total_raw_count} | 匹配有效端口 IP {clean_count} 个")
 
     sampled_pool = []
-    # 抽取 150 个 JP 节点进行延迟测试
     for country, nodes in raw_by_country.items():
         node_list = list(nodes)
         random.shuffle(node_list)
@@ -116,10 +114,10 @@ def fetch_extract_clean_and_sample():
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 样本分配] 已抽取 {len(sampled_pool)} 个真实地区样本（其中包含 JP: {len([x for x in sampled_pool if x.endswith('#JP')])} 个）")
+    print(f"🎯 [阶段 2: 样本分配] 已抽取 {len(sampled_pool)} 个样本进入连通性 & Google 重定向测试")
     return sampled_pool
 
-def check_keepalive(item):
+def check_keepalive_and_google_redirect(item):
     ip_port, country = item.rsplit("#", 1)
     
     port = int(ip_port.rsplit(":", 1)[-1])
@@ -132,27 +130,48 @@ def check_keepalive(item):
     trace_url = f"{protocol}://{ip_port}/cdn-cgi/trace"
 
     try:
+        # 1. 基础连通性测试
         t_start = time.time()
         res = http_session.get(trace_url, headers=cf_headers, timeout=1.5, verify=False, allow_redirects=False)
         t_cost = (time.time() - t_start) * 1000
 
-        if res.status_code == 200 and "h=" in res.text:
-            avg_latency = round(t_cost, 2)
-            score = avg_latency
-            
-            # JP/SG/US 给予优先倾斜
-            if country == "JP":
-                score -= 15
-            elif country in {"SG", "US"}:
-                score -= 10
+        if not (res.status_code == 200 and "h=" in res.text):
+            return None
 
-            return {
-                "entry": f"{ip_port}#{country}",
-                "country": country,
-                "continent": get_continent(country),
-                "latency": avg_latency,
-                "score": score
-            }
+        # 2. 针对非 HK 节点的精准 Google 漂移检测
+        # 通过 Host 探测 Cloudflare 边缘节点对 Google 请求的处理逻辑
+        if country in {"JP", "SG", "US", "GB"}:
+            try:
+                g_res = http_session.get(
+                    f"http://{ip_port}/",
+                    headers={"Host": "www.google.com", "User-Agent": cf_headers["User-Agent"]},
+                    timeout=1.5,
+                    allow_redirects=False,
+                    verify=False
+                )
+                location = g_res.headers.get("Location", "")
+                
+                # 精准拦截：如果明确重定向到了 google.com.hk 或 google.cn，说明该节点会导致 Google 识别回 HK，直接踢掉！
+                if "google.com.hk" in location or "google.cn" in location:
+                    return None
+            except Exception:
+                pass
+
+        avg_latency = round(t_cost, 2)
+        score = avg_latency
+        
+        if country == "JP":
+            score -= 15
+        elif country in {"SG", "US"}:
+            score -= 10
+
+        return {
+            "entry": f"{ip_port}#{country}",
+            "country": country,
+            "continent": get_continent(country),
+            "latency": avg_latency,
+            "score": score
+        }
     except Exception:
         pass
 
@@ -161,17 +180,17 @@ def check_keepalive(item):
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
     
-    print(f"🚀 [阶段 3: 并发筛选] 正在挑选高响应节点...")
+    print(f"🚀 [阶段 3: 并发筛选] 筛选响应快且无 Google HK 漂移的真正纯净节点...")
     
     valid_results = []
     with ThreadPoolExecutor(max_workers=60) as executor:
-        futures = [executor.submit(check_keepalive, item) for item in sampled_pool]
+        futures = [executor.submit(check_keepalive_and_google_redirect, item) for item in sampled_pool]
         for future in futures:
             res = future.result()
             if res:
                 valid_results.append(res)
 
-    print(f"🧪 测试完成：从 {len(sampled_pool)} 个样本中测出 {len(valid_results)} 个高响应节点。")
+    print(f"🧪 测试完成：筛出 {len(valid_results)} 个连通且防漂移的高响应节点。")
 
     valid_results.sort(key=lambda x: x["score"])
 
@@ -215,11 +234,6 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     final_entries = final_entries[:max_total]
     duration = round(time.time() - start_time, 2)
 
-    continent_counts = defaultdict(int)
-    for entry in final_entries:
-        ct = entry.rsplit("#", 1)[-1]
-        continent_counts[get_continent(ct)] += 1
-
     print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 最终入库节点: {len(final_entries)} 个")
     print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/15 | US: {len(primary_buckets['US'])}/10 | GB: {len(primary_buckets['GB'])}/10")
 
@@ -243,7 +257,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=15):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！已保留 HK 看 YouTube，并配齐 JP/SG 解锁 Gemini。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已精准排除漂移节点，确保选出的 JP/SG/US 节点解锁 Gemini！")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
