@@ -1,13 +1,14 @@
 import os
 import re
 import time
-import socket
 import random
 import requests
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 环境变量
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID")
@@ -18,34 +19,38 @@ CF_API_TOKEN = os.environ.get("CF_API_TOKEN")
 CF_ALLOWED_PORTS = {80, 443, 8080, 8443, 2052, 2053, 2082, 2083, 2086, 2087, 8880}
 PROXY_SOURCES = ["https://zip.cm.edu.kg/all.txt"]
 
-# ----------------- 1. 抽样预过滤上限 (控制在 300~800 规模) -----------------
-SAMPLE_PRIMARY_LIMITS = {
-    "JP": 100,  # 提升抽样上限，给予 JP 更多测试机会
-    "HK": 120,
-    "US": 120,
-    "SG": 100,
-    "GB": 80
+# ----------------- 大洲与国家代码映射表 -----------------
+CONTINENT_MAP = {
+    "AS": {"JP", "HK", "SG", "IN", "KR", "TW", "TH", "VN", "MY", "PH", "ID", "AE", "KH", "PK", "TR"},
+    "EU": {"GB", "DE", "FR", "NL", "FI", "IT", "ES", "SE", "PL", "RO", "CH", "AT", "CZ", "UA", "RU", "NO", "DK"},
+    "NA": {"US", "CA", "MX", "PR", "CR"},
+    "SA": {"BR", "AR", "CL", "CO", "PE"},
+    "AF": {"ZA", "EG", "NG", "KE", "MA"},
+    "OC": {"AU", "NZ", "FJ"}
 }
 
-SAMPLE_NICHE_LIMITS = {
-    "IN": 20, "FI": 20, "BR": 20, "AU": 20, "CA": 20,
-    "DE": 20, "FR": 20, "KR": 20, "TW": 20, "NL": 20
-}
+COUNTRY_TO_CONTINENT = {}
+for cont, countries in CONTINENT_MAP.items():
+    for c in countries:
+        COUNTRY_TO_CONTINENT[c] = cont
 
-DEFAULT_SAMPLE_MAX = 8
-
-# ----------------- 2. 最终写入 KV 的配额限制 (总数上限 100) -----------------
-FINAL_KV_LIMITS = {
-    "HK": 25, "US": 25, "SG": 20, "JP": 15, "GB": 10,
-    "IN": 3, "FI": 2, "BR": 2, "AU": 3, "CA": 3, "DE": 3, "FR": 3, "KR": 3, "TW": 3, "NL": 2
+# ----------------- 重构后的配额结构 (以 JP 为绝对核心) -----------------
+PRIMARY_LIMITS = {
+    "JP": 35,  # 提升日本节点配额，主攻电信硬扛与移动直连
+    "SG": 20,  # 亚太主力 2
+    "HK": 15,  # 亚太主力 3
+    "US": 10,  # 美洲长尾备用
+    "GB": 5,   # 欧洲长尾备用
 }
-DEFAULT_FINAL_MAX = 2
-MAX_TOTAL_RESULTS = 100  # 最终结果上限
+MAX_TOTAL_RESULTS = 100
+REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 15 个名额给各大洲保底与随机补充
+
+def get_continent(country):
+    return COUNTRY_TO_CONTINENT.get(country, "UNKNOWN")
 
 def create_http_session():
     session = requests.Session()
-    retries = Retry(total=2, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504], raise_on_status=False)
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=50, pool_maxsize=50)
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -72,13 +77,14 @@ def fetch_extract_clean_and_sample():
                 
                 total_raw_count += 1
 
-                # 提取后缀国家代码 (如 1.1.1.1:443#JP -> JP)
                 country = "UN"
                 if "#" in line:
                     parts = line.split("#")
                     line = parts[0].strip()
                     if len(parts) > 1 and parts[1].strip():
                         country = parts[1].strip().upper()
+                        if country == "UK":
+                            country = "GB"
 
                 match = ip_pattern.search(line)
                 if match:
@@ -93,126 +99,169 @@ def fetch_extract_clean_and_sample():
         except Exception as e:
             print(f"⚠️ 抓取源失败 {url}: {e}")
 
-    print(f"🔍 [阶段 1: 提取与清洗] 原始数据 {total_raw_count} 行 | 清洗出有效格式 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
+    print(f"🔍 [阶段 1: 清洗] 原始数据 {total_raw_count} 行 | 有效 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
 
     sampled_pool = []
     for country, nodes in raw_by_country.items():
         node_list = list(nodes)
         random.shuffle(node_list)
 
-        if country in SAMPLE_PRIMARY_LIMITS:
-            sample_size = SAMPLE_PRIMARY_LIMITS[country]
-        elif country in SAMPLE_NICHE_LIMITS:
-            sample_size = SAMPLE_NICHE_LIMITS[country]
+        cont = get_continent(country)
+        # 加大 JP/SG/HK 的抽样基数，确保选出最优质节点
+        if country == "JP":
+            sample_size = 180
+        elif country in {"SG", "HK", "US"}:
+            sample_size = 80
+        elif cont in {"AF", "SA", "OC"}:
+            sample_size = 20
         else:
-            sample_size = DEFAULT_SAMPLE_MAX
+            sample_size = 10
 
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 精细抽样] 从清洗结果中提取 {len(sampled_pool)} 个样本进入连通性测试")
+    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入连通性与抗 QoS 测试")
     return sampled_pool
 
 def check_keepalive(item):
     """
-    针对防误杀优化的连通性检测逻辑：
-    1. 增加建连超时至 2.5s，应对跨国高延迟节点
-    2. 采用通用型 HTTP 探测报文
-    3. 宽松判活机制：只要 TCP 建连成功且返回有效 HTTP 报头即视为活 IP
+    针对 JP 进行 3 次严格探针探测，剔除伪低延迟的高丢包节点
     """
     ip_port, raw_country = item.rsplit("#", 1)
-    sock = None
+    
+    headers = {
+        "Host": "www.cloudflare.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+
+    port = int(ip_port.rsplit(":", 1)[-1])
+    protocol = "https" if port in {443, 8443, 2053, 2083, 2087, 2096} else "http"
+    url = f"{protocol}://{ip_port}/cdn-cgi/trace"
+
+    latencies = []
+    real_country = raw_country
+    
+    # 日本节点开启 3 轮严格测试（防电信 QoS 丢包）；其他地区 2 轮测试
+    rounds = 3 if raw_country == "JP" else 2
+    timeout_val = 1.3 if raw_country == "JP" else 1.6
+
     try:
-        if ip_port.startswith("["):
-            ip = ip_port.rsplit("]:", 1)[0].replace("[", "")
-            port = int(ip_port.rsplit("]:", 1)[1])
-            family = socket.AF_INET6
-        else:
-            ip, port = ip_port.rsplit(":", 1)
-            port = int(port)
-            family = socket.AF_INET
+        for _ in range(rounds):
+            t_start = time.time()
+            res = http_session.get(
+                url, 
+                headers=headers, 
+                timeout=timeout_val, 
+                verify=False, 
+                allow_redirects=False
+            )
+            t_cost = (time.time() - t_start) * 1000
 
-        sock = socket.socket(family, socket.SOCK_STREAM)
-        # 核心修改 1：超时时间从 0.9s 放宽到 2.5s，防止在网络波动时误杀活 IP
-        sock.settimeout(2.5)
-        sock.connect((ip, port))
+            if res.status_code == 200 and "h=" in res.text and "colo=" in res.text:
+                latencies.append(t_cost)
+                loc_match = re.search(r'loc=([A-Z]{2})', res.text)
+                if loc_match:
+                    detected_loc = loc_match.group(1)
+                    if detected_loc != "UN":
+                        real_country = "GB" if detected_loc == "UK" else detected_loc
+            else:
+                return None  # 只要有一次丢包/超时，直接丢弃
 
-        # 核心修改 2：使用极简 HTTP/1.1 请求，减少因严格 Host 检查导致的连接被直接 reset
-        probe = (
-            f"GET / HTTP/1.1\r\n"
-            f"Host: {ip}\r\n"
-            f"User-Agent: Mozilla/5.0\r\n"
-            f"Connection: close\r\n\r\n"
-        )
-        sock.sendall(probe.encode("utf-8"))
-        
-        # 接收数据
-        response = sock.recv(1024).decode("utf-8", errors="ignore")
+        avg_latency = round(sum(latencies) / len(latencies), 2)
 
-        # 核心修改 3：宽松的响应判定，放宽误杀门槛
-        # 只要能响应 HTTP 规范格式（无论是 200, 301, 302, 400, 403, 404 等），或者有 Server/Cloudflare 标记，均视作活节点
-        if response.startswith("HTTP/") or "server:" in response.lower() or "cloudflare" in response.lower() or "fl=" in response:
-            # 优先检查响应头里是否有 Cloudflare 节点区域 loc=XX
-            if "loc=" in response:
-                match = re.search(r'loc=([A-Z]{2})', response)
-                if match and match.group(1) != "UN":
-                    return f"{ip_port}#{match.group(1)}"
-            
-            # 无法从响应中解析 loc 时，直接沿用源数据解析出的国家后缀
-            if raw_country != "UN":
-                return f"{ip_port}#{raw_country}"
+        # 排序积分：优先照顾移动 CMI 和电信硬扛的 JP/HK/SG 节点
+        score = avg_latency
+        if real_country == "JP":
+            score -= 20  # 日本节点获得最高优选权重
+        elif real_country in {"HK", "SG"}:
+            score -= 10
+
+        return {
+            "entry": f"{ip_port}#{real_country}",
+            "country": real_country,
+            "continent": get_continent(real_country),
+            "latency": avg_latency,
+            "score": score
+        }
 
     except Exception:
-        pass
-    finally:
-        if sock:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    return None
+        return None
 
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
-    country_buckets = defaultdict(list)
     
-    print(f"🚀 [阶段 3: 连通保活测试] 启动并发检测 (线程数: 30)...")
+    print(f"🚀 [阶段 3: 并发测试与日本/亚太倾斜评估] 启动检测 (线程数: 40)...")
+    
+    valid_results = []
+    with ThreadPoolExecutor(max_workers=40) as executor:
+        futures = [executor.submit(check_keepalive, item) for item in sampled_pool]
+        for future in futures:
+            res = future.result()
+            if res:
+                valid_results.append(res)
 
-    # 核心修改 4：线程池并发度由 60 降至 30，避免在 Actions 环境触发 FD/Socket 排队延时
-    with ThreadPoolExecutor(max_workers=30) as executor:
-        results = executor.map(check_keepalive, sampled_pool)
-        
-        for item in results:
-            if not item:
-                continue
-            
-            _, country = item.rsplit("#", 1)
-            max_allowed = FINAL_KV_LIMITS.get(country, DEFAULT_FINAL_MAX)
+    # 按照抗 QoS 综合得分（Score）排序
+    valid_results.sort(key=lambda x: x["score"])
 
-            if len(country_buckets[country]) < max_allowed:
-                country_buckets[country].append(item)
+    # 分组存储
+    primary_buckets = defaultdict(list)
+    other_by_continent = defaultdict(list)
 
-            total_valid = sum(len(v) for v in country_buckets.values())
+    for res in valid_results:
+        c = res["country"]
+        cont = res["continent"]
+        entry = res["entry"]
 
-            if total_valid >= max_total:
-                print(f"⚡ 已经集齐 {max_total} 个高质量有效 IP，提前终止测试！")
-                break
+        if c in PRIMARY_LIMITS:
+            if len(primary_buckets[c]) < PRIMARY_LIMITS[c]:
+                primary_buckets[c].append(entry)
+        else:
+            other_by_continent[cont].append(entry)
 
+    # ------------ 核心大洲覆盖算法 (保底 6 大洲均有节点) ------------
+    other_selected = []
+    all_continents = ["AS", "EU", "NA", "SA", "AF", "OC"]
+
+    # 1. 第一轮：在非主要地区中，强制选 1 个节点给各大洲保底
+    for cont in all_continents:
+        if other_by_continent[cont]:
+            chosen = random.choice(other_by_continent[cont])
+            other_selected.append(chosen)
+            other_by_continent[cont].remove(chosen)
+
+    # 2. 第二轮：剩余名额从所有非主要地区的可用节点中随机打散填充
+    remaining_pool = []
+    for cont, nodes in other_by_continent.items():
+        remaining_pool.extend(nodes)
+
+    random.shuffle(remaining_pool)
+    slots_left = REMAINING_POOL_LIMIT - len(other_selected)
+    if slots_left > 0:
+        other_selected.extend(remaining_pool[:slots_left])
+
+    # 汇总最终结果
     final_entries = []
-    for country, nodes in country_buckets.items():
-        final_entries.extend(nodes)
+    for c in ["JP", "SG", "HK", "US", "GB"]:  # 按照权重顺序排列
+        final_entries.extend(primary_buckets[c])
+    final_entries.extend(other_selected)
 
     final_entries = final_entries[:max_total]
-
     duration = round(time.time() - start_time, 2)
-    print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 最终提取纯净可用 IP: {len(final_entries)} 个 (含 JP: {len(country_buckets['JP'])} 个)")
+
+    # 统计各大洲覆盖情况
+    continent_counts = defaultdict(int)
+    for entry in final_entries:
+        ct = entry.rsplit("#", 1)[-1]
+        continent_counts[get_continent(ct)] += 1
+
+    print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 写入节点: {len(final_entries)} 个")
+    print(f"🇯🇵 主力日本 (JP): {len(primary_buckets['JP'])}/35 | 🇸🇬 新加坡 (SG): {len(primary_buckets['SG'])}/20 | 🇭🇰 香港 (HK): {len(primary_buckets['HK'])}/15")
+    print(f"🇺🇸 美国 (US): {len(primary_buckets['US'])}/10 | 🇬🇧 英国 (GB): {len(primary_buckets['GB'])}/5")
+    print(f"🌍 6大洲分布 -> 亚洲(AS): {continent_counts['AS']} | 欧洲(EU): {continent_counts['EU']} | 北美(NA): {continent_counts['NA']} | 南美(SA): {continent_counts['SA']} | 非洲(AF): {continent_counts['AF']} | 大洋洲(OC): {continent_counts['OC']}")
+
     return final_entries
 
-def safe_update_cloudflare_kv(valid_entries, min_required=40):
-    """
-    核心修改 5：把防空保护底线由 60 适当调低至 40
-    若遇网络大波动或源站恶化，只要活着 40 个以上就更新，避免因死守 60 个导致长时间无法更新 KV
-    """
+def safe_update_cloudflare_kv(valid_entries, min_required=30):
     if not (CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN):
         print("⚠️ 未配置 Cloudflare KV 环境变量，跳过写入。")
         return
@@ -230,7 +279,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=40):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！最终写入 {len(valid_entries)} 个纯净 IP。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已更新 35+ 个日本与亚太硬核 IP。")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
@@ -243,8 +292,7 @@ def main():
         return
 
     valid_entries = test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS)
-        
-    safe_update_cloudflare_kv(valid_entries, min_required=40)
+    safe_update_cloudflare_kv(valid_entries, min_required=30)
 
 if __name__ == "__main__":
     main()
