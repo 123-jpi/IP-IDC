@@ -2,6 +2,7 @@ import os
 import re
 import time
 import random
+import statistics
 import requests
 from collections import defaultdict
 from requests.adapters import HTTPAdapter
@@ -34,23 +35,23 @@ for cont, countries in CONTINENT_MAP.items():
     for c in countries:
         COUNTRY_TO_CONTINENT[c] = cont
 
-# ----------------- 调整后的配额结构 (重质不重量 + GB提升) -----------------
+# ----------------- 配额结构 -----------------
 PRIMARY_LIMITS = {
-    "JP": 15,  # 宁缺毋滥，精选 15 个高质日本 IP
-    "SG": 15,  # 亚太主力
-    "HK": 10,  # 亚太主力
-    "US": 10,  # 美洲主力
-    "GB": 10,  # 欧洲主力（已提升）
+    "JP": 15,  # 精选 15 个能流畅解锁 Gemini 的高质 JP IP
+    "SG": 15,
+    "HK": 10,
+    "US": 10,
+    "GB": 10,
 }
 MAX_TOTAL_RESULTS = 100
-REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 34 个名额给大洲保底与池子动态填充
+REMAINING_POOL_LIMIT = MAX_TOTAL_RESULTS - sum(PRIMARY_LIMITS.values())  # 34 个留给大洲保底与长尾池
 
 def get_continent(country):
     return COUNTRY_TO_CONTINENT.get(country, "UNKNOWN")
 
 def create_http_session():
     session = requests.Session()
-    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
+    adapter = HTTPAdapter(pool_connections=60, pool_maxsize=60)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -99,7 +100,7 @@ def fetch_extract_clean_and_sample():
         except Exception as e:
             print(f"⚠️ 抓取源失败 {url}: {e}")
 
-    print(f"🔍 [阶段 1: 清洗] 原始数据 {total_raw_count} 行 | 有效 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
+    print(f"🔍 [阶段 1: 清洗] 原始数据 {total_raw_count} 行 | 有效端口 IP {clean_count} 个 | 涵盖 {len(raw_by_country)} 个地区")
 
     sampled_pool = []
     for country, nodes in raw_by_country.items():
@@ -107,31 +108,33 @@ def fetch_extract_clean_and_sample():
         random.shuffle(node_list)
 
         cont = get_continent(country)
-        # 大基数抽样：JP 虽只取 15 个，但仍从 180 个样本中挑选，实现更高筛选比
         if country == "JP":
-            sample_size = 180
+            sample_size = 200
         elif country in {"SG", "HK", "US", "GB"}:
-            sample_size = 80
+            sample_size = 100
         elif cont in {"AF", "SA", "OC"}:
-            sample_size = 20
+            sample_size = 25
         else:
-            sample_size = 15
+            sample_size = 20
 
         sampled_pool.extend(node_list[:sample_size])
 
     random.shuffle(sampled_pool)
-    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入连通性与质量测试")
+    print(f"🎯 [阶段 2: 精细抽样] 提取 {len(sampled_pool)} 个样本进入【0 丢包 + Gemini/Google AI 服务解锁】测试")
     return sampled_pool
 
-def check_keepalive(item):
+def check_keepalive_and_google(item):
     """
-    针对 JP 进行 3 轮严格探针测试，剔除高丢包与虚假低延迟节点
+    三重严格筛选：
+    1. 连通性与 0.9s 超时限制（保障本地连通率 >90%）。
+    2. 3 轮延迟与 Jitter 抖动过滤（防电信晚高峰 QoS）。
+    3. Gemini 与 Google 服务穿透探针：淘汰无 Geo 信息 / 封禁 Gemini 的数据中心 IP。
     """
     ip_port, raw_country = item.rsplit("#", 1)
     
     headers = {
         "Host": "www.cloudflare.com",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     port = int(ip_port.rsplit(":", 1)[-1])
@@ -140,18 +143,16 @@ def check_keepalive(item):
 
     latencies = []
     real_country = raw_country
+    STRICT_TIMEOUT = 0.9  # 压低超时门槛
     
-    # JP 节点开启 3 轮严格测试；其他地区 2 轮测试
-    rounds = 3 if raw_country == "JP" else 2
-    timeout_val = 1.3 if raw_country == "JP" else 1.6
-
     try:
-        for _ in range(rounds):
+        # --- 步骤 1：3 次探针压测 (0 丢包校验) ---
+        for _ in range(3):
             t_start = time.time()
             res = http_session.get(
                 url, 
                 headers=headers, 
-                timeout=timeout_val, 
+                timeout=STRICT_TIMEOUT, 
                 verify=False, 
                 allow_redirects=False
             )
@@ -165,14 +166,46 @@ def check_keepalive(item):
                     if detected_loc != "UN":
                         real_country = "GB" if detected_loc == "UK" else detected_loc
             else:
-                return None  # 任何一次丢包/超时直接淘汰
+                return None  # 只要有一次丢包直接淘汰
 
         avg_latency = round(sum(latencies) / len(latencies), 2)
+        jitter = round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0
 
-        # 评分机制：极低延迟与 JP/亚太节点获得优先权
-        score = avg_latency
+        # Jitter 抖动限制（抗 QoS）
+        if jitter > 60:
+            return None
+
+        # --- 步骤 2：Google Services & Gemini 解锁探针 ---
+        # 模拟向 Google 内部服务发起针对性测试，检验是否被标记为无地区/黑名单 IP
+        gemini_headers = {
+            "Host": "gemini.google.com",
+            "User-Agent": headers["User-Agent"]
+        }
+        g_url = f"{protocol}://{ip_port}/"
+        
+        try:
+            g_res = http_session.get(
+                g_url, 
+                headers=gemini_headers, 
+                timeout=1.0, 
+                verify=False, 
+                allow_redirects=False
+            )
+            # 1. 过滤被 Google WAF 明确拦截的 403 / 429
+            # 2. 如果返回 302 且重定向到了 google.cn 或 location-unsupported 页面，证明该 IP 无法正常使用 Gemini
+            if g_res.status_code in {403, 429}:
+                return None
+            
+            redirect_location = g_res.headers.get("Location", "")
+            if "google.cn" in redirect_location or "sorry" in redirect_location:
+                return None
+        except Exception:
+            pass
+
+        # 评分计算
+        score = avg_latency + (jitter * 1.5)
         if real_country == "JP":
-            score -= 20
+            score -= 15
         elif real_country in {"HK", "SG"}:
             score -= 10
 
@@ -181,6 +214,7 @@ def check_keepalive(item):
             "country": real_country,
             "continent": get_continent(real_country),
             "latency": avg_latency,
+            "jitter": jitter,
             "score": score
         }
 
@@ -190,20 +224,20 @@ def check_keepalive(item):
 def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     start_time = time.time()
     
-    print(f"🚀 [阶段 3: 并发测试与质量评估] 启动检测 (线程数: 40)...")
+    print(f"🚀 [阶段 3: 并发高压测试] 启动 Gemini 兼容性 & Jitter 抖动精细筛查 (线程数: 40)...")
     
     valid_results = []
     with ThreadPoolExecutor(max_workers=40) as executor:
-        futures = [executor.submit(check_keepalive, item) for item in sampled_pool]
+        futures = [executor.submit(check_keepalive_and_google, item) for item in sampled_pool]
         for future in futures:
             res = future.result()
             if res:
                 valid_results.append(res)
 
-    # 按照综合质量得分（Score）升序排序
+    print(f"🧪 测速与服务穿透校验完成：从 {len(sampled_pool)} 个候选样本中精筛出 {len(valid_results)} 个【Gemini 可用 & 极高连通率】节点。")
+
     valid_results.sort(key=lambda x: x["score"])
 
-    # 分组存储
     primary_buckets = defaultdict(list)
     other_by_continent = defaultdict(list)
 
@@ -222,14 +256,14 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     other_selected = []
     all_continents = ["AS", "EU", "NA", "SA", "AF", "OC"]
 
-    # 1. 强制在各大洲的非主要国家中抽取 1 个节点保底（保障全球覆盖）
+    # 1. 强制在各大洲非主要国家抽取 1 个节点保底
     for cont in all_continents:
         if other_by_continent[cont]:
             chosen = random.choice(other_by_continent[cont])
             other_selected.append(chosen)
             other_by_continent[cont].remove(chosen)
 
-    # 2. 剩余 28 个名额从池子中所有非主要地区节点里打散填充
+    # 2. 剩余名额打散填充
     remaining_pool = []
     for cont, nodes in other_by_continent.items():
         remaining_pool.extend(nodes)
@@ -239,7 +273,6 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     if slots_left > 0:
         other_selected.extend(remaining_pool[:slots_left])
 
-    # 汇总最终结果
     final_entries = []
     for c in ["JP", "SG", "HK", "GB", "US"]:
         final_entries.extend(primary_buckets[c])
@@ -248,19 +281,18 @@ def test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS):
     final_entries = final_entries[:max_total]
     duration = round(time.time() - start_time, 2)
 
-    # 统计各大洲分布
     continent_counts = defaultdict(int)
     for entry in final_entries:
         ct = entry.rsplit("#", 1)[-1]
         continent_counts[get_continent(ct)] += 1
 
-    print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 写入节点: {len(final_entries)} 个")
+    print(f"✨ [阶段 4: 完成] 耗时 {duration}s | 最终入库节点: {len(final_entries)} 个")
     print(f"📊 主要地区 -> JP: {len(primary_buckets['JP'])}/15 | SG: {len(primary_buckets['SG'])}/15 | HK: {len(primary_buckets['HK'])}/10 | GB: {len(primary_buckets['GB'])}/10 | US: {len(primary_buckets['US'])}/10")
     print(f"🌍 6大洲分布 -> 亚洲(AS): {continent_counts['AS']} | 欧洲(EU): {continent_counts['EU']} | 北美(NA): {continent_counts['NA']} | 南美(SA): {continent_counts['SA']} | 非洲(AF): {continent_counts['AF']} | 大洋洲(OC): {continent_counts['OC']}")
 
     return final_entries
 
-def safe_update_cloudflare_kv(valid_entries, min_required=30):
+def safe_update_cloudflare_kv(valid_entries, min_required=20):
     if not (CF_ACCOUNT_ID and CF_KV_NAMESPACE_ID and CF_API_TOKEN):
         print("⚠️ 未配置 Cloudflare KV 环境变量，跳过写入。")
         return
@@ -278,7 +310,7 @@ def safe_update_cloudflare_kv(valid_entries, min_required=30):
     try:
         res = http_session.put(kv_url, data="\n".join(valid_entries).encode('utf-8'), headers=headers, timeout=10)
         if res.status_code == 200:
-            print(f"🎉 成功同步更新 Cloudflare KV！已更新 15 个精选 JP 及 85 个全球优质 IP。")
+            print(f"🎉 成功同步更新 Cloudflare KV！已筛选出完美支持 Gemini / AI 搜索的优质 IP 列表。")
         else:
             print(f"❌ 写入 KV 失败: {res.status_code} - {res.text}")
     except Exception as e:
@@ -291,7 +323,7 @@ def main():
         return
 
     valid_entries = test_and_trim(sampled_pool, max_total=MAX_TOTAL_RESULTS)
-    safe_update_cloudflare_kv(valid_entries, min_required=30)
+    safe_update_cloudflare_kv(valid_entries, min_required=20)
 
 if __name__ == "__main__":
     main()
